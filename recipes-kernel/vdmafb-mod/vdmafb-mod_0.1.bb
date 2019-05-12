@@ -1,4 +1,4 @@
-SUMMARY = "Xilinx VDMA Framebuffer driver"
+SUMMARY = "Example of how to build an external Linux kernel module"
 LICENSE = "GPLv2"
 LIC_FILES_CHKSUM = "file://COPYING;md5=9eef91148a9b14ec7f9df333daebc746"
 

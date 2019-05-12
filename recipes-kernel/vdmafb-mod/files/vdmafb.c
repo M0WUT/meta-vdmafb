@@ -87,6 +87,7 @@ static inline void vdmafb_writereg(struct vdmafb_dev *fbdev, loff_t offset, u32 
 	iowrite32(data, fbdev->regs + offset);
 }
 
+/*
 static int vdmafb_bl_update_status(struct backlight_device *bl)
 {
 	struct vdmafb_dev *fbdev = bl_get_data(bl);
@@ -114,7 +115,7 @@ static const struct backlight_ops vdmafb_bl_ops = {
 	.update_status = vdmafb_bl_update_status,
 	.get_brightness = vdmafb_bl_get_brightness,
 };
-
+*/
 static int vdmafb_setupfb(struct vdmafb_dev *fbdev)
 {
 	struct fb_var_screeninfo *var = &fbdev->info.var;
@@ -189,10 +190,10 @@ static int vdmafb_setupfb(struct vdmafb_dev *fbdev)
 	vdmafb_writereg(fbdev, VDMAFB_CONTROL, VDMAFB_CONTROL_ENABLE);
 
 	/* Set brightness */
-
+	/*
 	vdmafb_writereg(fbdev, VDMAFB_BACKLIGHT_CONTROL, 1);
 	vdmafb_writereg(fbdev, VDMAFB_BACKLIGHT_LEVEL_1K, 800);
-
+	*/
 	return 0;
 }
 
@@ -305,6 +306,7 @@ static int vdmafb_probe(struct platform_device *pdev)
 	struct backlight_properties props;
 	struct backlight_device *bl;
 
+	printk(KERN_INFO "Starting to load framebuffer driver, wish me luck!\n");
 	fbdev = devm_kzalloc(&pdev->dev, sizeof(*fbdev), GFP_KERNEL);
 	if (!fbdev)
 		return -ENOMEM;
@@ -380,6 +382,7 @@ static int vdmafb_probe(struct platform_device *pdev)
 	}
 
 	/* Register backlight */
+	/*
 	memset(&props, 0, sizeof(struct backlight_properties));
 	props.type = BACKLIGHT_RAW;
 	props.max_brightness = 1023;
@@ -394,7 +397,7 @@ static int vdmafb_probe(struct platform_device *pdev)
 		bl->props.fb_blank = FB_BLANK_UNBLANK;
 		bl->props.brightness = vdmafb_bl_get_brightness(bl);
 	}
-
+	*/
 	return 0;
 
 err_channel_free:
@@ -409,9 +412,10 @@ err_dma_free:
 static int vdmafb_remove(struct platform_device *pdev)
 {
 	struct vdmafb_dev *fbdev = platform_get_drvdata(pdev);
-
+	/*
 	if (fbdev->backlight)
 		backlight_device_unregister(fbdev->backlight);
+	*/
 	unregister_framebuffer(&fbdev->info);
 	/* Disable display */
 	vdmafb_writereg(fbdev, VDMAFB_BACKLIGHT_CONTROL, 0);
