@@ -40,27 +40,21 @@
 #include <linux/dma/xilinx_dma.h>
 
 /* Register locations */
-#define VDMAFB_CONTROL	0x00
+#define VDMAFB_BASE_ADDRESS 0x43000000
+#define VDMAFB_CONTROL_OFFSET		0x00
+#define VDMAFB_STATUS_OFFSET		0x04
+#define VDMAFB_VERSION_OFFSET		0x2C
+//Driver only support MM2S (DMA out)
+#define VDMAFB_VSIZE_OFFSET 		0x50
+#define VDMAFB_HSIZE_OFFSET 		0x54
+#define VDMAFB_STRIDE_OFFSET 		0x58
+#define VDMAFB_START_ADDRESS_BASE 	0x5C
 
-#define VDMAFB_HORIZONTAL_TOTAL	0x04
-#define VDMAFB_HORIZONTAL_WIDTH	0x08
-#define VDMAFB_HORIZONTAL_SYNC	0x0C
-#define VDMAFB_HORIZONTAL_FRONT_PORCH	0x10
-#define VDMAFB_HORIZONTAL_BACK_PORCH	0x14
-#define VDMAFB_HORIZONTAL_POLARITY	0x18
 
-#define VDMAFB_VERTICAL_TOTAL	0x1C
-#define VDMAFB_VERTICAL_HEIGHT	0x20
-#define VDMAFB_VERTICAL_SYNC	0x24
-#define VDMAFB_VERTICAL_FRONT_PORCH	0x28
-#define VDMAFB_VERTICAL_BACK_PORCH	0x2C
-#define VDMAFB_VERTICAL_POLARITY	0x30
+static void __iomem *base = NULL;
 
-#define VDMAFB_BACKLIGHT_CONTROL	0x50
-#define VDMAFB_BACKLIGHT_LEVEL_1K	0x54
 
-/* Register control flags */
-#define VDMAFB_CONTROL_ENABLE 1
+
 
 struct vdmafb_dev {
 	struct backlight_device *backlight;
@@ -77,123 +71,37 @@ struct vdmafb_dev {
 	u32 pseudo_palette[16];
 };
 
-static inline u32 vdmafb_readreg(struct vdmafb_dev *fbdev, loff_t offset)
+static inline u32 vdmafb_readreg(void* base, uint32_t offset)
 {
-	return ioread32(fbdev->regs + offset);
+	uint32_t data =  *((uint32_t*)(base + offset));
+	return data;
 }
 
-static inline void vdmafb_writereg(struct vdmafb_dev *fbdev, loff_t offset, u32 data)
+static inline void vdmafb_writereg(void* base, uint32_t offset, u32 data)
 {
-	iowrite32(data, fbdev->regs + offset);
+	printk(KERN_INFO "Writing data %u to address %x\n", data, offset);
+	*((uint32_t*)(base + offset)) = data;
 }
 
-/*
-static int vdmafb_bl_update_status(struct backlight_device *bl)
+
+static int vdmafb_setupfb(void *base, dma_addr_t dma_address)
 {
-	struct vdmafb_dev *fbdev = bl_get_data(bl);
-	int	brightness = bl->props.brightness;
-	u32 power = 1;
 
-	pr_debug("%s: b=%d p=%d\n",
-		__func__, brightness, bl->props.power);
-
-	if (bl->props.power != 0)
-		power = 0;
-	vdmafb_writereg(fbdev, VDMAFB_BACKLIGHT_CONTROL, power);
-	vdmafb_writereg(fbdev, VDMAFB_BACKLIGHT_LEVEL_1K, brightness);
-	return 0;
-}
-
-static int vdmafb_bl_get_brightness(struct backlight_device *bl)
-{
-	struct vdmafb_dev *fbdev = bl_get_data(bl);
-
-	return vdmafb_readreg(fbdev, VDMAFB_BACKLIGHT_LEVEL_1K);
-}
-
-static const struct backlight_ops vdmafb_bl_ops = {
-	.update_status = vdmafb_bl_update_status,
-	.get_brightness = vdmafb_bl_get_brightness,
-};
-*/
-static int vdmafb_setupfb(struct vdmafb_dev *fbdev)
-{
-	struct fb_var_screeninfo *var = &fbdev->info.var;
-	struct dma_async_tx_descriptor *desc;
-	struct dma_interleaved_template *dma_template = fbdev->dma_template;
-	struct xilinx_vdma_config vdma_config;
-	int hsize = var->xres * 4;
-	u32 frame;
-	int ret;
-
-	/* Disable display */
-	vdmafb_writereg(fbdev, VDMAFB_CONTROL, 0);
-
-	dmaengine_terminate_all(fbdev->dma);
-
-	/* Setup VDMA address etc */
-	memset(&vdma_config, 0, sizeof(vdma_config));
-	vdma_config.park = 1;
-	vdma_config.coalesc = 255; /* Reduces unused interrupts */
-	xilinx_vdma_channel_set_config(fbdev->dma, &vdma_config);
-
-       /*
-        * Interleaved DMA:
-        * Each interleaved frame is a row (hsize) implemented in ONE
-        * chunk (sgl has len 1).
-        * The number of interleaved frames is the number of rows (vsize).
-        * The icg in used to pack data to the HW, so that the buffer len
-        * is fb->piches[0], but the actual size for the hw is somewhat less
-        */
-       dma_template->dir = DMA_MEM_TO_DEV;
-       dma_template->src_start = fbdev->fb_phys;
-       /* sgl list have just one entry (each interleaved frame have 1 chunk) */
-       dma_template->frame_size = 1;
-       /* the number of interleaved frame, each has the size specified in sgl */
-       dma_template->numf = var->yres;
-       dma_template->src_sgl = 1;
-       dma_template->src_inc = 1;
-       /* vdma IP does not provide any addr to the hdmi IP */
-       dma_template->dst_inc = 0;
-       dma_template->dst_sgl = 0;
-       /* horizontal size */
-       dma_template->sgl[0].size = hsize;
-       /* the vdma driver seems to look at icg, and not src_icg */
-       dma_template->sgl[0].icg = 0; /*  stride - hsize */
-
-	for (frame = 0; frame < fbdev->frames; ++frame) {
-		desc = dmaengine_prep_interleaved_dma(fbdev->dma, dma_template, 0);
-		if (!desc) {
-			pr_err("Failed to prepare DMA descriptor\n");
-			return -ENOMEM;
-		}
-		dmaengine_submit(desc);
-	}
-	dma_async_issue_pending(fbdev->dma);
-
-	/* Configure IP via registers */
-	vdmafb_writereg(fbdev, VDMAFB_HORIZONTAL_TOTAL,
-		var->hsync_len + var->left_margin + var->xres + var->right_margin);
-	vdmafb_writereg(fbdev, VDMAFB_HORIZONTAL_SYNC, var->hsync_len);
-	vdmafb_writereg(fbdev, VDMAFB_HORIZONTAL_FRONT_PORCH, var->left_margin);
-	vdmafb_writereg(fbdev, VDMAFB_HORIZONTAL_WIDTH, var->xres);
-	vdmafb_writereg(fbdev, VDMAFB_HORIZONTAL_BACK_PORCH, var->right_margin);
-	vdmafb_writereg(fbdev, VDMAFB_HORIZONTAL_POLARITY, 0); /* TODO */
-	vdmafb_writereg(fbdev, VDMAFB_VERTICAL_TOTAL,
-		var->vsync_len + var->upper_margin + var->yres + var->lower_margin);
-	vdmafb_writereg(fbdev, VDMAFB_VERTICAL_SYNC, var->vsync_len);
-	vdmafb_writereg(fbdev, VDMAFB_VERTICAL_FRONT_PORCH, var->upper_margin);
-	vdmafb_writereg(fbdev, VDMAFB_VERTICAL_HEIGHT, var->yres);
-	vdmafb_writereg(fbdev, VDMAFB_VERTICAL_BACK_PORCH, var->lower_margin);
-	vdmafb_writereg(fbdev, VDMAFB_VERTICAL_POLARITY, 0);
-	/* Enable output */
-	vdmafb_writereg(fbdev, VDMAFB_CONTROL, VDMAFB_CONTROL_ENABLE);
-
-	/* Set brightness */
-	/*
-	vdmafb_writereg(fbdev, VDMAFB_BACKLIGHT_CONTROL, 1);
-	vdmafb_writereg(fbdev, VDMAFB_BACKLIGHT_LEVEL_1K, 800);
-	*/
+	/* Enable display - DMA engine doesn't start until VSIZE has been written */
+	u32 version_reg = vdmafb_readreg(base, VDMAFB_VERSION_OFFSET);
+	int major = (version_reg >> 28) & 0x0F;
+	int minor = (version_reg >> 20) & 0xFF;
+	printk("VDMA version %d.%d\n", major, minor);
+	printk(KERN_INFO "Status register pre-config: %d", vdmafb_readreg(base, VDMAFB_STATUS_OFFSET));
+	vdmafb_writereg(base, VDMAFB_CONTROL_OFFSET, 0x03);
+	vdmafb_writereg(base, VDMAFB_START_ADDRESS_BASE, (uint32_t)dma_address);
+	vdmafb_writereg(base, VDMAFB_STRIDE_OFFSET, 1280 * 4);
+	vdmafb_writereg(base, VDMAFB_HSIZE_OFFSET, 1280 * 4);
+	vdmafb_writereg(base, VDMAFB_VSIZE_OFFSET, 720);
+	printk(KERN_INFO "Status register post-config: %d", vdmafb_readreg(base, VDMAFB_STATUS_OFFSET));
+	msleep(1000);
+	printk(KERN_INFO "Status register post-sleep: %d", vdmafb_readreg(base, VDMAFB_STATUS_OFFSET));
+	
 	return 0;
 }
 
@@ -235,7 +143,7 @@ static void vdmafb_init_var(struct vdmafb_dev *fbdev, struct platform_device *pd
 	ret = of_property_read_u32(np, "num-fstores", &fbdev->frames);
 	if (ret) {
 		dev_err(&pdev->dev, "Can't parse num-fstores property, assume 3\n");
-		fbdev->frames = 3;
+		fbdev->frames = 1;
 	}
 
 	var->accel_flags = FB_ACCEL_NONE;
@@ -299,6 +207,7 @@ static struct fb_ops vdmafb_ops = {
 
 static int vdmafb_probe(struct platform_device *pdev)
 {
+	
 	int ret = 0;
 	struct vdmafb_dev *fbdev;
 	struct resource *res;
@@ -310,7 +219,7 @@ static int vdmafb_probe(struct platform_device *pdev)
 	fbdev = devm_kzalloc(&pdev->dev, sizeof(*fbdev), GFP_KERNEL);
 	if (!fbdev)
 		return -ENOMEM;
-
+	/*
 	platform_set_drvdata(pdev, fbdev);
 
 	fbdev->info.fbops = &vdmafb_ops;
@@ -326,18 +235,19 @@ static int vdmafb_probe(struct platform_device *pdev)
 	vdmafb_init_var(fbdev, pdev);
 	vdmafb_init_fix(fbdev);
 
-	/* Request I/O resource */
+	// Request I/O resource 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
 		dev_err(&pdev->dev, "I/O resource request failed\n");
 		return -ENXIO;
 	}
 	res->flags &= ~IORESOURCE_CACHEABLE;
-	fbdev->regs = devm_ioremap_resource(&pdev->dev, res);
+	//fbdev->regs = devm_ioremap_resource(&pdev->dev, res);
+	fbdev->regs = ioremap(VDMAFB_BASE_ADDRESS, SZ_4K);
 	if (IS_ERR(fbdev->regs))
 		return PTR_ERR(fbdev->regs);
 
-	/* Allocate framebuffer memory */
+	// Allocate framebuffer memory 
 	fbsize = fbdev->info.fix.smem_len;
 	fbdev->fb_virt = dma_alloc_coherent(&pdev->dev, PAGE_ALIGN(fbsize),
 					    &fbdev->fb_phys, GFP_KERNEL);
@@ -353,9 +263,10 @@ static int vdmafb_probe(struct platform_device *pdev)
 	pr_debug("%s virt=%p phys=%x size=%d\n", __func__,
 		fbdev->fb_virt, fbdev->fb_phys, fbsize);
 
-	/* Clear framebuffer */
+	// Clear framebuffer 
 	memset_io(fbdev->fb_virt, 0, fbsize);
 
+	
 	fbdev->dma = dma_request_slave_channel(&pdev->dev, "video");
 	if (IS_ERR_OR_NULL(fbdev->dma)) {
 		dev_err(&pdev->dev, "Failed to allocate DMA channel (%d).\n", ret);
@@ -365,22 +276,26 @@ static int vdmafb_probe(struct platform_device *pdev)
 			ret = -EPROBE_DEFER;
 		goto err_dma_free;
 	}
-
-	/* Setup and enable the framebuffer */
-	vdmafb_setupfb(fbdev);
-
+	*/
+	
+	// Setup and enable the framebuffer 
+	base = ioremap(VDMAFB_BASE_ADDRESS, SZ_4K);
+	dma_addr_t dma_address;
+	dma_alloc_coherent(&pdev->dev, 1280 * 720 * 4, &dma_address, GFP_KERNEL);
+	vdmafb_setupfb(base, dma_address);
+	/*
 	ret = fb_alloc_cmap(&fbdev->info.cmap, 256, 0);
 	if (ret) {
 		dev_err(&pdev->dev, "fb_alloc_cmap failed\n");
 	}
 
-	/* Register framebuffer */
+	// Register framebuffer 
 	ret = register_framebuffer(&fbdev->info);
 	if (ret) {
 		dev_err(&pdev->dev, "Framebuffer registration failed\n");
 		goto err_channel_free;
 	}
-
+	*/
 	/* Register backlight */
 	/*
 	memset(&props, 0, sizeof(struct backlight_properties));
@@ -400,13 +315,12 @@ static int vdmafb_probe(struct platform_device *pdev)
 	*/
 	return 0;
 
-err_channel_free:
-	dma_release_channel(fbdev->dma);
+/*
 err_dma_free:
 	dma_free_coherent(&pdev->dev, PAGE_ALIGN(fbsize), fbdev->fb_virt,
 			  fbdev->fb_phys);
+*/
 
-	return ret;
 }
 
 static int vdmafb_remove(struct platform_device *pdev)
@@ -418,8 +332,8 @@ static int vdmafb_remove(struct platform_device *pdev)
 	*/
 	unregister_framebuffer(&fbdev->info);
 	/* Disable display */
-	vdmafb_writereg(fbdev, VDMAFB_BACKLIGHT_CONTROL, 0);
-	vdmafb_writereg(fbdev, VDMAFB_CONTROL, 0);
+	//vdmafb_writereg(fbdev, VDMAFB_BACKLIGHT_CONTROL, 0);
+	vdmafb_writereg(fbdev, VDMAFB_CONTROL_OFFSET, 3);
 	dma_release_channel(fbdev->dma);
 	dma_free_coherent(&pdev->dev, PAGE_ALIGN(fbdev->info.fix.smem_len),
 			  fbdev->fb_virt, fbdev->fb_phys);
