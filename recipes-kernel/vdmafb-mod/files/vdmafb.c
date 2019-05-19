@@ -4,22 +4,37 @@
  *
  * Copyright (C) 2014 Topic Embedded Products
  * Author: Mike Looijmans <mike.looijmans@topic.nl>
- *
+ * 
+ * Modified: Dan McGraw <dan.m0wut@gmail.com>
+ * Modifications to get compatibility with VDMA v6.3
+ * 
  * Licensed under the GPL-2.
  *
+ * dma_address: IO address for the VDMA control registers
+ * 
+ * resolution: 	string, changing this requires the video section to be clocked
+ * 				at different speed. All supported options are listed
+ * 
+ * resolution	Clock Speed (MHz)	Horizontal pixels	Vertical lines
+ * "720p" 		74.25				1280				720
+ * "1080p"		165					1920				1080
+ * 
+ * format: bits per pixel (bpp) and how they are packed. VDMA settings will need to match
+ * All supported options are listed (VDMA really likes bytes per pixel to be a power of 2)
+ * 
+ * format		total bpp	transparency bits(MSB)	red bits	green bits	blue bits(LSB)	
+ * "rgba"		32 			8						8			8			8
+ * "rgb565"		16			0						5			6			5
+ * 
  * Example devicetree contents:
  		axi_vdma_vga: axi_vdma_vga@7e000000 {
 			compatible = "topic,vdma-fb";
 			reg = <0x7e000000 0x10000>;
-			dmas = <&axi_vdma_0 0>;
-			dma-names = "video";
-			width = <1024>;
-			height = <600>;
-			horizontal-front-porch = <160>;
-			horizontal-back-porch = <160>;
-			horizontal-sync = <136>;
-			vertical-front-porch = <17>;
-			vertical-back-porch = <18>;
+			dmas = <&axi_vdma_0 0>;		
+			dma_address = <0x43000000>;
+			num-fstores = <1>;
+			resolution = "720p"
+			format = "rgba"
 		};
  */
 
@@ -40,7 +55,6 @@
 #include <linux/dma/xilinx_dma.h>
 
 /* Register locations */
-#define VDMAFB_BASE_ADDRESS 0x43000000
 #define VDMAFB_CONTROL_OFFSET		0x00
 #define VDMAFB_STATUS_OFFSET		0x04
 #define VDMAFB_VERSION_OFFSET		0x2C
@@ -50,58 +64,66 @@
 #define VDMAFB_STRIDE_OFFSET 		0x58
 #define VDMAFB_START_ADDRESS_BASE 	0x5C
 
-
-static void __iomem *base = NULL;
-
-
+#define DEBUG 1
 
 
 struct vdmafb_dev {
-	struct backlight_device *backlight;
 	struct fb_info info;
+	// Base Address for VDMA control registers
+	uint32_t vdma_base_addr;
 	void __iomem *regs;
-	/* Physical and virtual addresses of framebuffer */
-	phys_addr_t fb_phys;
+	// Physical and virtual addresses of framebuffer 
+	dma_addr_t fb_phys;
 	void __iomem *fb_virt;
-	/* VDMA handle */
-	struct dma_chan *dma;
-	struct dma_interleaved_template *dma_template;
+	// Number of Framebuffers
 	u32 frames;
-	/* Palette data */
+	// Palette data 
 	u32 pseudo_palette[16];
 };
 
-static inline u32 vdmafb_readreg(void* base, uint32_t offset)
+static inline u32 vdmafb_readreg(struct vdmafb_dev* dev, uint32_t offset)
 {
-	uint32_t data =  *((uint32_t*)(base + offset));
+	uint32_t data =  *((uint32_t*)(dev->regs + offset));
 	return data;
 }
 
-static inline void vdmafb_writereg(void* base, uint32_t offset, u32 data)
+static inline void vdmafb_writereg(struct vdmafb_dev* dev, uint32_t offset, u32 data)
 {
-	printk(KERN_INFO "Writing data %u to address %x\n", data, offset);
-	*((uint32_t*)(base + offset)) = data;
+	#if DEBUG
+		printk(KERN_INFO "Writing data %u to address %x\n", data, offset);
+	#endif
+	*((uint32_t*)(dev->regs + offset)) = data;
 }
 
-
-static int vdmafb_setupfb(void *base, dma_addr_t dma_address)
+static int vdmafb_setup_vdma(struct vdmafb_dev* fbdev)
 {
-
-	/* Enable display - DMA engine doesn't start until VSIZE has been written */
-	u32 version_reg = vdmafb_readreg(base, VDMAFB_VERSION_OFFSET);
+	struct fb_var_screeninfo *var = &fbdev->info.var;
+	// Enable display - DMA engine doesn't start until VSIZE has been written 
+	u32 version_reg = vdmafb_readreg(fbdev, VDMAFB_VERSION_OFFSET);
 	int major = (version_reg >> 28) & 0x0F;
 	int minor = (version_reg >> 20) & 0xFF;
-	printk("VDMA version %d.%d\n", major, minor);
-	printk(KERN_INFO "Status register pre-config: %d", vdmafb_readreg(base, VDMAFB_STATUS_OFFSET));
-	vdmafb_writereg(base, VDMAFB_CONTROL_OFFSET, 0x03);
-	vdmafb_writereg(base, VDMAFB_START_ADDRESS_BASE, (uint32_t)dma_address);
-	vdmafb_writereg(base, VDMAFB_STRIDE_OFFSET, 1280 * 4);
-	vdmafb_writereg(base, VDMAFB_HSIZE_OFFSET, 1280 * 4);
-	vdmafb_writereg(base, VDMAFB_VSIZE_OFFSET, 720);
-	printk(KERN_INFO "Status register post-config: %d", vdmafb_readreg(base, VDMAFB_STATUS_OFFSET));
-	msleep(1000);
-	printk(KERN_INFO "Status register post-sleep: %d", vdmafb_readreg(base, VDMAFB_STATUS_OFFSET));
+	if (major != 6 || minor != 32) {
+		printk(KERN_ERR "VDMA version %d.%d is incompatible with driver which expects v6.32\n", major, minor);
+		printk(KERN_ERR "This may also be due to an incorrect VDMA base address being supplied\n");
+		return -EINVAL;
+	}
 	
+	#if DEBUG
+		printk(KERN_INFO "Status register pre-config: %d", vdmafb_readreg(fbdev, VDMAFB_STATUS_OFFSET));
+	#endif	
+
+	vdmafb_writereg(fbdev, VDMAFB_CONTROL_OFFSET, 0x03);
+	vdmafb_writereg(fbdev, VDMAFB_START_ADDRESS_BASE, (uint32_t)fbdev->fb_phys);
+	// These are line_length not var->xres as it's bytes per line, not pixels
+	vdmafb_writereg(fbdev, VDMAFB_STRIDE_OFFSET, fbdev->info.fix.line_length);
+	vdmafb_writereg(fbdev, VDMAFB_HSIZE_OFFSET, fbdev->info.fix.line_length);
+	vdmafb_writereg(fbdev, VDMAFB_VSIZE_OFFSET, var->yres);
+
+	#if DEBUG
+		printk(KERN_INFO "Status register post-config: %d", vdmafb_readreg(fbdev, VDMAFB_STATUS_OFFSET));
+		msleep(1000);
+		printk(KERN_INFO "Status register post-sleep: %d", vdmafb_readreg(fbdev, VDMAFB_STATUS_OFFSET));
+	#endif
 	return 0;
 }
 
@@ -112,7 +134,7 @@ static void vdmafb_init_fix(struct vdmafb_dev *fbdev)
 
 	strcpy(fix->id, "vdma-fb");
 	fix->line_length = var->xres * (var->bits_per_pixel/8);
-	fix->smem_len = fix->line_length * var->yres;
+	fix->smem_len = fix->line_length * var->yres * fbdev->frames;
 	fix->type = FB_TYPE_PACKED_PIXELS;
 	fix->visual = FB_VISUAL_TRUECOLOR;
 }
@@ -123,17 +145,41 @@ static void vdmafb_init_var(struct vdmafb_dev *fbdev, struct platform_device *pd
 	struct fb_var_screeninfo *var = &fbdev->info.var;
 	int ret;
 
-	ret = of_property_read_u32(np, "width", &var->xres);
+	ret = of_property_read_u32(np, "dma_address", &fbdev->vdma_base_addr);
 	if (ret) {
-		dev_err(&pdev->dev, "Can't parse width property, assume 1024\n");
-		var->xres = 1024;
+		dev_err(&pdev->dev, "Can't parse VDMA address. Assume 0x43000000\n");
+		fbdev->vdma_base_addr = 0x43000000;
+	}
+	#if DEBUG
+		printk(KERN_INFO "VDMA Base Address: %#010x", fbdev->vdma_base_addr);
+	#endif
+
+	const char *resolution_string;
+	ret = of_property_read_string(np, "resolution", &resolution_string);
+	if (ret) {
+		dev_err(&pdev->dev, "Can't parse resolution\n");
 	}
 
-	ret = of_property_read_u32(np, "height", &var->yres);
-	if (ret) {
-		dev_err(&pdev->dev, "Can't parse height property, assume 768\n");
-		var->yres = 768;
+	// Resolution settings defined here
+	if (!strcmp(resolution_string, "720p"))
+	{
+		var->xres = 1280;
+		var->yres = 720;
+		var->pixclock = KHZ2PICOS(74250);
 	}
+	else if (!strcmp(resolution_string, "1080p"))
+	{
+		var->xres = 1920;
+		var->yres = 1080;
+		var->pixclock = KHZ2PICOS(165000);
+	}
+	else
+	{
+		dev_err(&pdev->dev, "Unsupported resolution passed to VDMA module\n");
+	}
+	
+	printk(KERN_INFO "Framebuffer resolution set to %u x %u", var->xres, var->yres);
+
 
 	/*
 	 * Xilinx VDMA requires clients to submit exactly the number of frame
@@ -142,34 +188,57 @@ static void vdmafb_init_var(struct vdmafb_dev *fbdev, struct platform_device *pd
 	 */
 	ret = of_property_read_u32(np, "num-fstores", &fbdev->frames);
 	if (ret) {
-		dev_err(&pdev->dev, "Can't parse num-fstores property, assume 3\n");
+		dev_err(&pdev->dev, "Can't parse num-fstores property, assume 1\n");
 		fbdev->frames = 1;
 	}
+	#if DEBUG
+		printk(KERN_INFO "Read number of framebuffers as %u", fbdev->frames);
+	#endif
 
-	var->accel_flags = FB_ACCEL_NONE;
-	var->activate = FB_ACTIVATE_NOW;
 	var->xres_virtual = var->xres;
 	var->yres_virtual = var->yres;
-	var->bits_per_pixel = 32;
-	/* Clock settings */
-	var->pixclock = KHZ2PICOS(51200);
+
+	// Fixed Framebuffer settings
 	var->vmode = FB_VMODE_NONINTERLACED;
-	of_property_read_u32(np, "horizontal-sync", &var->hsync_len);
-	of_property_read_u32(np, "horizontal-front-porch", &var->left_margin);
-	of_property_read_u32(np, "horizontal-back-porch", &var->right_margin);
-	of_property_read_u32(np, "vertical-sync", &var->vsync_len);
-	of_property_read_u32(np, "vertical-front-porch", &var->upper_margin);
-	of_property_read_u32(np, "vertical-back-porch", &var->lower_margin);
-	/* TODO: sync */
-	/* 32 BPP */
-	var->transp.offset = 24;
-	var->transp.length = 8;
-	var->red.offset = 16;
-	var->red.length = 8;
-	var->green.offset = 8;
-	var->green.length = 8;
+	var->accel_flags = FB_ACCEL_NONE;
+	var->activate = FB_ACTIVATE_NOW;
+
+	// Colour per pixel settings
+	const char *format_string;
+	ret = of_property_read_string(np, "format", &format_string);
+	if (ret) {
+		dev_err(&pdev->dev, "Can't parse pixel format\n");
+	}
+
+	// Format settings defined here
+	if (!strcmp(format_string, "rgba"))
+	{
+		var->bits_per_pixel = 32;
+		var->transp.length = 8;
+		var->red.length = 8;
+		var->green.length = 8;
+		var->blue.length = 8;
+	}
+	else if (!strcmp(format_string, "rgb565"))
+	{
+		var->bits_per_pixel = 16;
+		var->transp.length = 0;
+		var->red.length = 5;
+		var->green.length = 6;
+		var->blue.length = 5;
+	}
+	else
+	{
+		dev_err(&pdev->dev, "Unsupported pixel format passed to VDMA module\n");
+	}
+	
+	printk(KERN_INFO "Pixel format set to %s", format_string);
+	
+	// I've assumed that order is always (MSB -> LSB) transp, red, green, blue 
 	var->blue.offset = 0;
-	var->blue.length = 8;
+	var->green.offset = var->blue.length;
+	var->red.offset = var->green.offset + var->green.length;
+	var->transp.offset = var->red.offset + var->red.length;
 }
 
 static int vdmafb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
@@ -207,34 +276,24 @@ static struct fb_ops vdmafb_ops = {
 
 static int vdmafb_probe(struct platform_device *pdev)
 {
-	
 	int ret = 0;
 	struct vdmafb_dev *fbdev;
 	struct resource *res;
-	int fbsize;
-	struct backlight_properties props;
-	struct backlight_device *bl;
 
 	printk(KERN_INFO "Starting to load framebuffer driver, wish me luck!\n");
 	fbdev = devm_kzalloc(&pdev->dev, sizeof(*fbdev), GFP_KERNEL);
 	if (!fbdev)
 		return -ENOMEM;
-	/*
+	
 	platform_set_drvdata(pdev, fbdev);
 
 	fbdev->info.fbops = &vdmafb_ops;
 	fbdev->info.device = &pdev->dev;
 	fbdev->info.par = fbdev;
 
-	fbdev->dma_template = devm_kzalloc(&pdev->dev,
-		sizeof(struct dma_interleaved_template) +
-		sizeof(struct data_chunk), GFP_KERNEL);
-	if (!fbdev->dma_template)
-		return -ENOMEM;
-
 	vdmafb_init_var(fbdev, pdev);
 	vdmafb_init_fix(fbdev);
-
+	
 	// Request I/O resource 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
@@ -242,100 +301,65 @@ static int vdmafb_probe(struct platform_device *pdev)
 		return -ENXIO;
 	}
 	res->flags &= ~IORESOURCE_CACHEABLE;
-	//fbdev->regs = devm_ioremap_resource(&pdev->dev, res);
-	fbdev->regs = ioremap(VDMAFB_BASE_ADDRESS, SZ_4K);
+
+	// Map VDMA control registers into virtual memory
+	fbdev->regs = ioremap(fbdev->vdma_base_addr, SZ_4K);
 	if (IS_ERR(fbdev->regs))
 		return PTR_ERR(fbdev->regs);
+	
+	// Sanity check Framebuffer size
+	if (!fbdev->info.fix.smem_len) {
+		dev_err(&pdev->dev, "Framebuffer size must be non-zero");
+	}
 
-	// Allocate framebuffer memory 
-	fbsize = fbdev->info.fix.smem_len;
-	fbdev->fb_virt = dma_alloc_coherent(&pdev->dev, PAGE_ALIGN(fbsize),
-					    &fbdev->fb_phys, GFP_KERNEL);
+	// Allocate Framebuffer Memory
+	fbdev->fb_virt = dma_alloc_coherent(&pdev->dev, fbdev->info.fix.smem_len, &fbdev->fb_phys, GFP_KERNEL);
 	if (!fbdev->fb_virt) {
-		dev_err(&pdev->dev,
-			"Frame buffer memory allocation failed\n");
+		dev_err(&pdev->dev,"Frame buffer memory allocation failed\n");
 		return -ENOMEM;
 	}
+	
 	fbdev->info.fix.smem_start = fbdev->fb_phys;
 	fbdev->info.screen_base = fbdev->fb_virt;
 	fbdev->info.pseudo_palette = fbdev->pseudo_palette;
 
-	pr_debug("%s virt=%p phys=%x size=%d\n", __func__,
-		fbdev->fb_virt, fbdev->fb_phys, fbsize);
-
 	// Clear framebuffer 
-	memset_io(fbdev->fb_virt, 0, fbsize);
+	memset_io(fbdev->fb_virt, 0, fbdev->info.fix.smem_len);
 
-	
-	fbdev->dma = dma_request_slave_channel(&pdev->dev, "video");
-	if (IS_ERR_OR_NULL(fbdev->dma)) {
-		dev_err(&pdev->dev, "Failed to allocate DMA channel (%d).\n", ret);
-		if (fbdev->dma)
-			ret = PTR_ERR(fbdev->dma);
-		else
-			ret = -EPROBE_DEFER;
-		goto err_dma_free;
-	}
-	*/
-	
 	// Setup and enable the framebuffer 
-	base = ioremap(VDMAFB_BASE_ADDRESS, SZ_4K);
-	dma_addr_t dma_address;
-	dma_alloc_coherent(&pdev->dev, 1280 * 720 * 4, &dma_address, GFP_KERNEL);
-	vdmafb_setupfb(base, dma_address);
-	/*
+	if (vdmafb_setup_vdma(fbdev))
+		return EINVAL; // Version incompatability
+
+
+	//Create Colour map information
 	ret = fb_alloc_cmap(&fbdev->info.cmap, 256, 0);
 	if (ret) {
 		dev_err(&pdev->dev, "fb_alloc_cmap failed\n");
 	}
 
-	// Register framebuffer 
+	// Register framebuffer
 	ret = register_framebuffer(&fbdev->info);
 	if (ret) {
 		dev_err(&pdev->dev, "Framebuffer registration failed\n");
-		goto err_channel_free;
+		goto err_dma_free;
 	}
-	*/
-	/* Register backlight */
-	/*
-	memset(&props, 0, sizeof(struct backlight_properties));
-	props.type = BACKLIGHT_RAW;
-	props.max_brightness = 1023;
-	bl = backlight_device_register("backlight", &pdev->dev, fbdev,
-				       &vdmafb_bl_ops, &props);
-	if (IS_ERR(bl)) {
-		dev_err(&pdev->dev, "error %ld on backlight register\n",
-				PTR_ERR(bl));
-	} else {
-		fbdev->backlight = bl;
-		bl->props.power = FB_BLANK_UNBLANK;
-		bl->props.fb_blank = FB_BLANK_UNBLANK;
-		bl->props.brightness = vdmafb_bl_get_brightness(bl);
-	}
-	*/
+
 	return 0;
 
-/*
+
 err_dma_free:
-	dma_free_coherent(&pdev->dev, PAGE_ALIGN(fbsize), fbdev->fb_virt,
+	dma_free_coherent(&pdev->dev, fbdev->info.fix.smem_len, fbdev->fb_virt,
 			  fbdev->fb_phys);
-*/
 
 }
 
 static int vdmafb_remove(struct platform_device *pdev)
 {
 	struct vdmafb_dev *fbdev = platform_get_drvdata(pdev);
-	/*
-	if (fbdev->backlight)
-		backlight_device_unregister(fbdev->backlight);
-	*/
 	unregister_framebuffer(&fbdev->info);
 	/* Disable display */
-	//vdmafb_writereg(fbdev, VDMAFB_BACKLIGHT_CONTROL, 0);
 	vdmafb_writereg(fbdev, VDMAFB_CONTROL_OFFSET, 3);
-	dma_release_channel(fbdev->dma);
-	dma_free_coherent(&pdev->dev, PAGE_ALIGN(fbdev->info.fix.smem_len),
+	dma_free_coherent(&pdev->dev, fbdev->info.fix.smem_len,
 			  fbdev->fb_virt, fbdev->fb_phys);
 	fb_dealloc_cmap(&fbdev->info.cmap);
 	return 0;
